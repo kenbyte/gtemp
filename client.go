@@ -4,170 +4,132 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
-	"os"
-	"time"
+	"net/url"
 
-	"github.com/gorilla/websocket"
-	"golang.org/x/time/rate"
+	"github.com/kenbyte/Anzar"
 )
 
-type Config struct {
-	BaseURL     string
-	APIKey      string
-	AuthEnabled bool
-	RateLimiter *rate.Limiter
+var (
+	ecmwfapiUrl = "https://api.open-meteo.com/v1"
+	hrrrapiUrl  = "https://api.open-meteo.com/v1"
+	metarapiURL = "https://aviationweather.gov/api"
 
-	MaxRetries int
-}
+	ecmwfClient *Anzar.Client
+	hrrrClient  *Anzar.Client
+	metarClient *Anzar.Client
 
-func shouldRetry(statusCode int) bool {
-	return statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504
-}
-func isRetryableNetworkError(err error) bool {
-	if netErr, ok := err.(net.Error); ok {
-		return netErr.Temporary() || netErr.Timeout()
-	}
-	return false
-}
+	ecmwfErr error
+	hrrrErr  error
+	metarErr error
+)
 
-type myClient struct {
-	c      *http.Client
-	t      *http.Transport
-	cfg    Config
-	wsConn *websocket.Conn
-}
-
-func setupTransport() *http.Transport {
-	return &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		MaxConnsPerHost:     10,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		DisableKeepAlives:   false,
+func initECMWFClient() {
+	ecmwfClient, ecmwfErr = Anzar.NewClient(ecmwfapiUrl, false)
+	if ecmwfErr != nil {
+		fmt.Printf("Error creating ECMWF client: %v\n", ecmwfErr)
 	}
 }
 
-func setupClient(t *http.Transport) *http.Client {
-	return &http.Client{
-		Transport: t,
-		Timeout:   30 * time.Second,
+func initHRRRClient() {
+	hrrrClient, hrrrErr = Anzar.NewClient(hrrrapiUrl, false)
+	if hrrrErr != nil {
+		fmt.Printf("Error creating HRRR client: %v\n", hrrrErr)
 	}
 }
 
-func setupConfig(baseURL string, auth bool, r *rate.Limiter) (*Config, error) {
-	cfg := &Config{
-		BaseURL:     baseURL,
-		AuthEnabled: auth,
-		RateLimiter: r,
-		MaxRetries:  5,
+func initMETARClient() {
+	metarClient, metarErr = Anzar.NewClient(metarapiURL, false)
+	if ecmwfErr != nil {
+		fmt.Printf("Error creating METAR client: %v\n", metarErr)
 	}
-
-	if auth {
-		api := os.Getenv("APIKEY")
-		if api == "" {
-			return nil, fmt.Errorf("APIKEY required but not set")
-		}
-		cfg.APIKey = api
-	}
-
-	return cfg, nil
 }
 
-func newClient(baseURL string, auth bool) (*myClient, error) {
-	t := setupTransport()
-	r := rate.NewLimiter(rate.Every(time.Second), 5)
+func buildForecastQuery(lat, lon float64, unit, days, model string) string {
+	q := url.Values{}
 
-	cfg, err := setupConfig(baseURL, auth, r)
-	if err != nil {
-		return nil, err
-	}
+	q.Set("latitude", fmt.Sprintf("%f", lat))
+	q.Set("longitude", fmt.Sprintf("%f", lon))
+	q.Set("daily", "temperature_2m_max")
+	q.Set("temperature_unit", unit)
+	q.Set("forecast_days", days)
+	q.Set("models", model)
 
-	return &myClient{
-		c:   setupClient(t),
-		t:   t,
-		cfg: *cfg,
-	}, nil
+	return "/forecast?" + q.Encode()
+}
+func buildMetarQuery(station string) string {
+	q := url.Values{}
+	q.Set("ids", station)
+	q.Set("format", "json")
+
+	return "/data/metar?" + q.Encode()
 }
 
-func (c *myClient) Do(req *http.Request) (*http.Response, error) {
-	var lastErr error
-
-	if c.cfg.RateLimiter != nil {
-		if err := c.cfg.RateLimiter.Wait(req.Context()); err != nil {
-			return nil, err
-		}
+func (city *City) getECMWF() {
+	initECMWFClient()
+	if ecmwfErr != nil {
+		fmt.Println("ECMWF Client initialization failed.")
+		return
 	}
 
-	if c.cfg.AuthEnabled {
-		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	maxAttempts := c.cfg.MaxRetries + 1
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		resp, err := c.c.Do(req)
-
-		if err == nil {
-			if resp.StatusCode < 400 {
-				return resp, nil
-			}
-
-			if attempt < maxAttempts-1 && shouldRetry(resp.StatusCode) {
-				resp.Body.Close()
-
-				backoff := time.Second * time.Duration(1<<attempt)
-
-				select {
-				case <-time.After(backoff):
-					continue
-				case <-req.Context().Done():
-					return nil, req.Context().Err()
-				}
-			}
-
-			return resp, fmt.Errorf("http error: %d %s", resp.StatusCode, resp.Status)
-		}
-
-		lastErr = err
-
-		if attempt < maxAttempts-1 && isRetryableNetworkError(err) {
-			backoff := time.Second * time.Duration(1<<attempt)
-
-			select {
-			case <-time.After(backoff):
-				continue
-			case <-req.Context().Done():
-				return nil, req.Context().Err()
-			}
-		}
-
-		break
-	}
-
-	return nil, fmt.Errorf(
-		"request failed after %d attempts: %w",
-		maxAttempts,
-		lastErr,
+	requestPath := buildForecastQuery(
+		city.Lat,
+		city.Long,
+		"celsius",
+		"2",
+		"ecmwf_ifs025",
 	)
+
+	ctx := context.Background()
+
+	resp, err := ecmwfClient.Get(ctx, requestPath)
+	if err != nil {
+		fmt.Printf("Error making request to ECMWF API: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("Error reading response body: %v\n", err)
+		return
+	}
+
+	fmt.Println(string(body))
 }
 
-func (c *myClient) Get(ctx context.Context, path string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+path, nil)
-	if err != nil {
-		return nil, err
+func (city *City) getHRRR() {
+	initHRRRClient()
+	if hrrrErr != nil {
+		fmt.Println("HRRR Client initialization failed.")
+		return
 	}
-	return c.Do(req)
+
+	requestPath := buildForecastQuery(
+		city.Lat,
+		city.Long,
+		"fahrenheit",
+		"1",
+		"gfs_seamless",
+	)
+
+	ctx := context.Background()
+
+	resp, err := hrrrClient.Get(ctx, requestPath)
+	if err != nil {
+		fmt.Printf("Error making request to HRRR API: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("Error reading response body: %v\n", err)
+		return
+	}
+
+	fmt.Println(string(body))
 }
 
-func (c *myClient) Post(ctx context.Context, path string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+path, body)
-	if err != nil {
-		return nil, err
-	}
-	return c.Do(req)
+func main() {
+	dallas.getHRRR()
 }
